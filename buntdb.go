@@ -452,6 +452,36 @@ func (db *DB) SetConfig(config Config) error {
 	return nil
 }
 
+func (db *DB) fastInsert(item *dbItem) *dbItem {
+	var pdbi *dbItem
+	prev := db.keys.Set(item)
+	if prev != nil {
+		pdbi = prev.(*dbItem)
+		if pdbi.opts != nil && pdbi.opts.ex {
+			// Remove it from the expires tree.
+			db.exps.Delete(pdbi)
+		}
+		for _, idx := range db.idxs {
+			if idx.match(item.key) {
+				if idx.btr != nil {
+					// Remove it from the btree index.
+					idx.btr.Delete(pdbi)
+				}
+				if idx.rtr != nil {
+					// Remove it from the rtree index.
+					idx.rtr.Remove(pdbi)
+				}
+			}
+		}
+	}
+	if item.opts != nil && item.opts.ex {
+		// The new item has eviction options. Add it to the
+		// expires tree
+		db.exps.Set(item)
+	}
+	return pdbi
+}
+
 // insertIntoDatabase performs inserts an item in to the database and updates
 // all indexes. If a previous item with the same key already exists, that item
 // will be replaced with the new one, and return the previous item.
@@ -1429,6 +1459,8 @@ func (dbi *dbItem) Rect(ctx interface{}) (min, max []float64) {
 type SetOptions struct {
 	// Expires indicates that the Set() key-value will expire
 	Expires bool
+	// for keys that would not match any indexes for sure
+	NoCustomIndexCheck bool
 	// TTL is how much time the key-value will exist in the database
 	// before being evicted. The Expires field must also be set to true.
 	// TTL stands for Time-To-Live.
@@ -1487,15 +1519,22 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 		return "", false, ErrTxIterating
 	}
 	item := &dbItem{key: key, val: value}
+	var prev *dbItem
 	if opts != nil {
 		if opts.Expires {
 			// The caller is requesting that this item expires. Convert the
 			// TTL to an absolute time and bind it to the item.
 			item.opts = &dbItemOpts{ex: true, exat: time.Now().Add(opts.TTL)}
 		}
+		if opts.NoCustomIndexCheck {
+			prev = tx.db.fastInsert(item)
+		} else {
+			prev = tx.db.insertIntoDatabase(item)
+		}
+	} else {
+		// Insert the item into the keys tree.
+		prev = tx.db.insertIntoDatabase(item)
 	}
-	// Insert the item into the keys tree.
-	prev := tx.db.insertIntoDatabase(item)
 
 	// insert into the rollback map if there has not been a deleteAll.
 	if tx.wc.rbkeys == nil {
